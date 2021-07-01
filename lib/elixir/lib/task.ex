@@ -442,6 +442,16 @@ defmodule Task do
   end
 
   @doc """
+  TODO: write docs
+  """
+  @spec completed(any()) :: Task.Completed.t()
+  def completed(result) do
+    ref = make_ref()
+    owner = self()
+    %Task.Completed{result: result, ref: ref, owner: owner}
+  end
+
+  @doc """
   Returns a stream where the given function (`module` and `function_name`)
   is mapped concurrently on each element in `enumerable`.
 
@@ -752,6 +762,15 @@ defmodule Task do
     end
   end
 
+  def await(%Task.Completed{result: result, owner: owner} = task, timeout)
+      when is_timeout(timeout) do
+    if owner != self() do
+      raise ArgumentError, invalid_owner_error(task)
+    end
+
+    result
+  end
+
   @doc """
   Awaits replies from multiple tasks and returns them.
 
@@ -795,15 +814,34 @@ defmodule Task do
   @doc since: "1.11.0"
   @spec await_many([t], timeout) :: [term]
   def await_many(tasks, timeout \\ 5000) when is_timeout(timeout) do
+    for task <- tasks do
+      case task do
+        %Task{} -> :ok
+        %Task.Completed{} -> :ok
+        invalid_task -> raise(%MatchError{term: invalid_task})
+      end
+    end
+
     awaiting =
-      for task <- tasks, into: %{} do
-        %Task{ref: ref, owner: owner} = task
+      for %Task{} = task <- tasks, into: %{} do
+        %{ref: ref, owner: owner} = task
 
         if owner != self() do
           raise ArgumentError, invalid_owner_error(task)
         end
 
         {ref, true}
+      end
+
+    replies =
+      for %Task.Completed{} = task <- tasks, into: %{} do
+        %{ref: ref, owner: owner, result: result} = task
+
+        if owner != self() do
+          raise ArgumentError, invalid_owner_error(task)
+        end
+
+        {ref, result}
       end
 
     timeout_ref = make_ref()
@@ -814,7 +852,7 @@ defmodule Task do
       end
 
     try do
-      await_many(tasks, timeout, awaiting, %{}, timeout_ref)
+      await_many(tasks, timeout, awaiting, replies, timeout_ref)
     after
       timer_ref && Process.cancel_timer(timer_ref)
       receive do: (^timeout_ref -> :ok), after: (0 -> :ok)
@@ -865,11 +903,17 @@ defmodule Task do
 
       %Task{} ->
         nil
+
+      %Task.Completed{} ->
+        nil
     end)
   end
 
   def find(tasks, {:DOWN, ref, _, proc, reason} = msg) when is_reference(ref) do
-    find = fn %Task{ref: task_ref} -> task_ref == ref end
+    find = fn
+      %Task{ref: task_ref} -> task_ref == ref
+      %Task.Completed{} -> false
+    end
 
     if Enum.find(tasks, find) do
       exit({reason(reason, proc), {__MODULE__, :find, [tasks, msg]}})
@@ -939,6 +983,15 @@ defmodule Task do
       timeout ->
         nil
     end
+  end
+
+  def yield(%Task.Completed{result: result, owner: owner} = task, timeout)
+      when is_timeout(timeout) do
+    if owner != self() do
+      raise ArgumentError, invalid_owner_error(task)
+    end
+
+    {:ok, result}
   end
 
   @doc """
@@ -1045,6 +1098,18 @@ defmodule Task do
     end
   end
 
+  defp yield_many(
+         [%Task.Completed{result: result, owner: owner} = task | rest],
+         timeout_ref,
+         timeout
+       ) do
+    if owner != self() do
+      raise ArgumentError, invalid_owner_error(task)
+    end
+
+    [{task, {:ok, result}} | yield_many(rest, timeout_ref, timeout)]
+  end
+
   defp yield_many([], _timeout_ref, _timeout) do
     []
   end
@@ -1074,6 +1139,10 @@ defmodule Task do
   """
   @spec shutdown(t, timeout | :brutal_kill) :: {:ok, term} | {:exit, term} | nil
   def shutdown(task, shutdown \\ 5000)
+
+  def shutdown(%Task.Completed{} = task, _) do
+    raise ArgumentError, "task #{inspect(task)} does not have an associated task process"
+  end
 
   def shutdown(%Task{pid: nil} = task, _) do
     raise ArgumentError, "task #{inspect(task)} does not have an associated task process"
